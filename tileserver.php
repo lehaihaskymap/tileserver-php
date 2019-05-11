@@ -55,6 +55,12 @@ class Server {
   public $dbLayer = array();
 
   /**
+   * Datasets stored in virtual file
+   * @var array
+   */
+  public $vrtLayer = array();
+
+  /**
    * PDO database connection
    * @var object
    */
@@ -93,6 +99,7 @@ class Server {
   public function setDatasets() {
     $mjs = glob('*/metadata.json');
     $mbts = glob($this->config['dataRoot'] . '*.mbtiles');
+    $vrts = glob($this->config['dataRoot'] . '*.vrtiles');    
     if ($mjs) {
       foreach (array_filter($mjs, 'is_readable') as $mj) {
         $layer = $this->metadataFromMetadataJson($mj);
@@ -104,6 +111,13 @@ class Server {
         $this->dbLayer[] = $this->metadataFromMbtiles($mbt);
       }
     }
+    if ($vrts) {
+      foreach (array_filter($vrts, 'is_readable') as $vrt) {
+        $this->vrtLayer[] = $this->metadataFromVrtiles($vrt);
+      }
+    }
+
+    // var_dump($this->vrtLayer);    
   }
 
   /**
@@ -152,6 +166,19 @@ class Server {
     }
   }
 
+  /**
+   * Testing if is a virtual layer
+   * @param string $layer
+   * @return boolean
+   */
+  public function isVrtLayer($layer) {
+    if (is_file($this->config['dataRoot'] . $layer . '.vrtiles')) {
+      return TRUE;
+    } else {
+      return FALSE;
+    }
+  } 
+    
   /**
    * Testing if is a file layer
    * @param string $layer
@@ -229,14 +256,70 @@ class Server {
   }
 
   /**
+   * Loads metadata from Vrtiles
+   * @param string $vrt
+   * @return object
+   */
+  public function metadataFromVrtiles($vrt) {
+    $metadata = array();
+    $this->DBconnect($vrt);
+    $result = $this->db->query('select * from metadata');
+
+    $resultdata = $result->fetchAll();
+    foreach ($resultdata as $r) {
+      $value = preg_replace('/(\\n)+/', '', $r['value']);
+      $metadata[$r['name']] = addslashes($value);
+    }
+    $metadata['minzoom']=0;
+    $metadata['maxzoom']=17;
+    if (!array_key_exists('minzoom', $metadata)
+    || !array_key_exists('maxzoom', $metadata)
+    ) {
+      // autodetect minzoom and maxzoom
+      $result = $this->db->query('select min(zoom_level) as min, max(zoom_level) as max from tiles');
+      $resultdata = $result->fetchAll();
+      if (!array_key_exists('minzoom', $metadata)){
+        $metadata['minzoom'] = $resultdata[0]['min'];
+      }
+      if (!array_key_exists('maxzoom', $metadata)){
+        $metadata['maxzoom'] = $resultdata[0]['max'];
+      }
+    }
+    // autodetect format using JPEG magic number FFD8
+    if (!array_key_exists('format', $metadata)) {
+      $metadata['format'] = 'png';
+    }
+    // var_dump($metadata);
+    // autodetect bounds
+    if (!array_key_exists('bounds', $metadata)) {
+      $result = $this->db->query('select min(txmin) as w, max(txmax) as e, min(tymin) as s, max(tymax) as n from subtiles where z='.$metadata['maxzoom']);
+      $resultdata = $result->fetchAll();
+      $w = -180 + 360 * ($resultdata[0]['w'] / pow(2, $metadata['maxzoom']));
+      $e = -180 + 360 * ((1 + $resultdata[0]['e']) / pow(2, $metadata['maxzoom']));
+      $n = $this->row2lat($resultdata[0]['n'], $metadata['maxzoom']);
+      $s = $this->row2lat($resultdata[0]['s'] - 1, $metadata['maxzoom']);
+      $metadata['bounds'] = implode(',', array($w, $s, $e, $n));
+    }
+    $vrt = explode('.', $vrt);
+    $metadata['basename'] = $vrt[0];
+    $metadata = $this->metadataValidation($metadata);
+    return $metadata;
+  }
+    
+  /**
    * Convert row number to latitude of the top of the row
    * @param integer $r
    * @param integer $zoom
    * @return integer
    */
    public function row2lat($r, $zoom) {
-     $y = $r / pow(2, $zoom - 1 ) - 1;
-     return rad2deg(2.0 * atan(exp(3.191459196 * $y)) - 1.57079632679489661922);
+    //  $y = $r / pow(2, $zoom - 1 ) - 1;
+    //  return rad2deg(2.0 * atan(exp(3.191459196 * $y)) - 1.57079632679489661922);
+    $originShift = M_PI * 6378137;
+    $my=$r * M_PI * 6378137 / pow(2, ($zoom-1)) - $originShift;
+    $lat=($my / $originShift) * 180.0;
+    $lat=180.0 / M_PI * (2 * atan( exp( $lat * M_PI / 180.0)) - M_PI / 2.0);
+    return $lat;    
    }
 
   /**
@@ -310,6 +393,21 @@ class Server {
     }
   }
 
+  public function TmpDBconnect($tileset) {
+    try {
+      return new PDO('sqlite:' . $tileset, '', '', array(PDO::ATTR_PERSISTENT => true));
+    } catch (Exception $exc) {
+      echo $exc->getTraceAsString();
+      die;
+    }
+
+    if (!isset($this->db)) {
+      header('Content-type: text/plain');
+      echo 'Incorrect tileset name: ' . $tileset;
+      die;
+    }
+  }  
+
   /**
    * Check if file is modified and set Etag headers
    * @param string $filename
@@ -329,6 +427,25 @@ class Server {
     }
   }
 
+   /**
+   * Check if file is modified and set Etag headers
+   * @param string $filename
+   * @return boolean
+   */
+  public function isVrtModified($filename) {
+    $filename = $this->config['dataRoot'] . $filename . '.vrtiles';
+    $lastModifiedTime = filemtime($filename);
+    $eTag = md5($lastModifiedTime);
+    header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $lastModifiedTime) . ' GMT');
+    header('Etag:' . $eTag);
+    if (@strtotime($_SERVER['HTTP_IF_MODIFIED_SINCE']) == $lastModifiedTime ||
+            @trim($_SERVER['HTTP_IF_NONE_MATCH']) == $eTag) {
+      return TRUE;
+    } else {
+      return FALSE;
+    }
+  }
+
   /**
    * Returns tile of dataset
    * @param string $tileset
@@ -338,7 +455,89 @@ class Server {
    * @param string $ext
    */
   public function renderTile($tileset, $z, $y, $x, $ext) {
-    if ($this->isDBLayer($tileset)) {
+    if ($this->isVrtLayer($tileset)) {
+      if ($this->isVrtModified($tileset) == TRUE) {
+        header('Access-Control-Allow-Origin: *');
+        header('HTTP/1.1 304 Not Modified');
+        die;
+      }
+      $this->DBconnect($this->config['dataRoot'] . $tileset . '.vrtiles');
+      #read basetile
+      $result = $this->db->query('select value from metadata where name="basetile"');
+      $basetile = $result->fetchColumn(); 
+      $result = $this->db->query('select value from metadata where name="minzoom"');
+      $minzoom = $result->fetchColumn(); 
+      $minzoom=floatval($minzoom);
+      $result = $this->db->query('select value from metadata where name="maxzoom"');
+      $maxzoom = $result->fetchColumn(); 
+      $maxzoom=floatval($maxzoom);
+
+      $z = floatval($z);
+      $y = floatval($y);
+      $x = floatval($x);
+      $flip = true;
+      if ($flip) {
+        $y = pow(2, $z) - 1 - $y;
+      }
+  
+      if (($z>=$minzoom) && ($z<=$maxzoom)){
+        $mbtilefile=$this->config['dataRoot'] . $basetile . '.mbtiles';
+        $cnn=$this->TmpDBconnect($mbtilefile);
+        $result = $cnn->query('select tile_data as t from tiles where zoom_level=' . $z . ' and tile_column=' . $x . ' and tile_row=' . $y);
+        $data = $result->fetchColumn();   
+        if (!isset($data) || $data === FALSE) {
+            //if tile doesn't exist
+            //select scale of tile (for retina tiles)
+            $result = $this->db->query('select value from metadata where name="scale"');
+            $resultdata = $result->fetchColumn();
+            $scale = isset($resultdata) && $resultdata !== FALSE ? $resultdata : 1;
+            $this->getCleanTile($scale, $ext);
+        } else {
+            $result = $this->db->query('select value from metadata where name="format"');           
+            $resultdata = $result->fetchColumn();         
+            $format = isset($resultdata) && $resultdata !== FALSE ? $resultdata : 'png';
+            if ($format == 'jpg') {
+              $format = 'jpeg';
+            }             
+            if ($format == 'pbf') {
+              header('Content-type: application/x-protobuf');
+              header('Content-Encoding:gzip');
+            } else {
+              header('Content-type: image/' . $format);
+            }
+            header('Access-Control-Allow-Origin: *');
+            echo $data;
+        }                      
+      } else {
+          #query for detailtilesets
+          $detailtilesets=[];
+          $stmt=$this->db->prepare('select name from subtiles where z=:zoom and txmin<=:tx and txmax>=:tx and tymin<=:ty and tymax>=:ty');
+          $stmt->execute([':zoom'=>$z, ':tx'=>$x, ':ty'=>$y]);
+          while ($row = $stmt->fetch(\PDO::FETCH_ASSOC)) {
+            $detailtilesets[]=$row['name'];
+          }
+
+          // var_dump($detailtilesets);
+          // die;
+          if (count($detailtilesets)==0) {
+            $this->getCleanTile();
+            die;
+          }
+          $tileset=$detailtilesets[0];
+          $mbtilefile=$this->config['dataRoot'] . $tileset . '.mbtiles';
+          $cnn=$this->TmpDBconnect($mbtilefile);
+          $result = $cnn->query('select tile_data as t from tiles where zoom_level=' . $z . ' and tile_column=' . $x . ' and tile_row=' . $y);
+          $data = $result->fetchColumn();
+          if (!isset($data)){
+            $this->getCleanTile();
+            die;            
+          } 
+
+          header('Content-type: image/png');
+          header('Access-Control-Allow-Origin: *');
+          echo $data;
+      }
+    } elseif ($this->isDBLayer($tileset)) {
       if ($this->isModified($tileset) == true) {
         header('Access-Control-Allow-Origin: *');
         header('HTTP/1.1 304 Not Modified');
@@ -348,7 +547,7 @@ class Server {
       $z = floatval($z);
       $y = floatval($y);
       $x = floatval($x);
-      $flip = true;
+      $flip = ($ext=='terrain')?false:true;
       if ($flip) {
         $y = pow(2, $z) - 1 - $y;
       }
@@ -364,13 +563,17 @@ class Server {
       } else {
         $result = $this->db->query('select value from metadata where name="format"');
         $resultdata = $result->fetchColumn();
-        $format = isset($resultdata) && $resultdata !== false ? $resultdata : 'png';
+        // $format = isset($resultdata) && $resultdata !== false ? $resultdata : 'png';
+        $format = isset($resultdata) && $resultdata !== FALSE ? $resultdata : $ext;        
         if ($format == 'jpg') {
           $format = 'jpeg';
         }
         if ($format == 'pbf') {
           header('Content-type: application/x-protobuf');
           header('Content-Encoding:gzip');
+        } elseif ($format=='terrain') {
+          header('Content-type: application/octet-stream');
+          header('Content-Encoding:gzip');          
         } else {
           header('Content-type: image/' . $format);
         }
@@ -509,7 +712,7 @@ class Server {
    */
   public function getInfo() {
     $this->setDatasets();
-    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    $maps = array_merge($this->fileLayer, $this->dbLayer, $this->vrtLayer);
     header('Content-Type: text/html;charset=UTF-8');
     echo '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' . $this->config['serverTitle'] . '</title></head><body>' .
       '<h1>' . $this->config['serverTitle'] . '</h1>' .
@@ -534,12 +737,14 @@ class Server {
    */
   public function getHtml() {
     $this->setDatasets();
-    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    $maps = array_merge($this->fileLayer, $this->dbLayer, $this->vrtLayer);
     if (isset($this->config['template']) && file_exists($this->config['template'])) {
       $baseUrls = $this->config['baseUrls'];
       $serverTitle = $this->config['serverTitle'];
       include_once $this->config['template'];
     } else {
+      // var_dump($maps);
+      // die;           
       header('Content-Type: text/html;charset=UTF-8');
       echo '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>' . $this->config['serverTitle'] . '</title>';
       echo '<link rel="stylesheet" type="text/css" href="//cdn.klokantech.com/tileviewer/v1/index.css" />
@@ -555,15 +760,18 @@ class Server {
               <p>Note: The maps can be a directory with tiles in XYZ format with metadata.json file.<br/>
               You can easily convert existing geodata (GeoTIFF, ECW, MrSID, etc) to this tile structure with <a href="http://www.maptiler.com">MapTiler Cluster</a> or open-source projects such as <a href="http://www.klokan.cz/projects/gdal2tiles/">GDAL2Tiles</a> or <a href="http://www.maptiler.org/">MapTiler</a> or simply upload any maps in MBTiles format made by <a href="http://www.tilemill.com/">TileMill</a>. Helpful is also the <a href="https://github.com/mapbox/mbutil">mbutil</a> tool. Serving directly from .mbtiles files is supported, but with decreased performance.</p>';
       } else {
-        echo '<ul>';
+        echo '<ul>';     
         foreach ($maps as $map) {
-          echo "<li>" . $map['name'] . '</li>';
+          // var_dump($map);
+          echo "<li>" . $map['basename'] . '</li>';
         }
         echo '</ul>';
       }
       echo '</body></html>';
     }
   }
+
+
 
 }
 
@@ -623,7 +831,16 @@ class Json extends Server {
   public function metadataTileJson($metadata) {
     $metadata['tilejson'] = '2.0.0';
     $metadata['scheme'] = 'xyz';
-    if ($this->isDBLayer($metadata['basename'])) {
+    if ($this->isVrtLayer($metadata['basename'])) {
+      $cnn=$this->tmpDBconnect($this->config['dataRoot'] . $metadata['basetile'] . '.mbtiles');
+      $res = $cnn->query('SELECT name FROM sqlite_master WHERE name="grids";');
+      if ($res) {
+        foreach ($this->config['baseUrls'] as $url) {
+          $grids[] = '' . $this->config['protocol'] . '://' . $url . '/' . $metadata['basename'] . '/{z}/{x}/{y}.grid.json';
+        }
+        $metadata['grids'] = $grids;
+      }
+    } elseif ($this->isDBLayer($metadata['basename'])) {
       $this->DBconnect($this->config['dataRoot'] . $metadata['basename'] . '.mbtiles');
       $res = $this->db->query('SELECT name FROM sqlite_master WHERE name="grids";');
       if ($res) {
@@ -651,10 +868,29 @@ class Json extends Server {
    * @return string
    */
   private function createJson($basename) {
-    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    if ($basename=='layer') { // Cesium terrain tiles
+      $layerjson=array(
+        "tilejson"=> "2.1.0",
+        "format"=>"heightmap-1.0",
+        "version"=> "1.0.0",
+        "scheme"=> "tms",
+        "tiles"=> array("{z}/{x}/{y}.terrain")
+      );
+      echo json_encode($layerjson);
+
+      die;
+    }
+
+    $maps = array_merge($this->fileLayer, $this->dbLayer, $this->vrtLayer);
+    // var_dump($this->isVrtLayer);
+    // die;
+    // $maps = array_merge($this->vrtLayer);
+
     if ($basename == 'index') {
       $output = '[';
       foreach ($maps as $map) {
+        // var_dump($map);
+
         $output = $output . json_encode($this->metadataTileJson($map)) . ',';
       }
       if (strlen($output) > 1) {
@@ -936,7 +1172,7 @@ class Wmts extends Server {
    */
   public function getCapabilities() {
 
-    $layers = array_merge($this->fileLayer, $this->dbLayer);
+    $layers = array_merge($this->fileLayer, $this->dbLayer, $this->vrtLayer);
 
     //if TileMatrixSet is provided validate it
     for($i = 0; $i < count($layers); $i++){
@@ -1143,7 +1379,7 @@ class Tms extends Server {
    */
   public function getCapabilities() {
     parent::setDatasets();
-    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    $maps = array_merge($this->fileLayer, $this->dbLayer, $this->vrtLayer);
     header('Content-type: application/xml');
     echo'<TileMapService version="1.0.0"><TileMaps>';
     foreach ($maps as $m) {
@@ -1169,7 +1405,7 @@ class Tms extends Server {
    */
   public function getLayerCapabilities() {
     parent::setDatasets();
-    $maps = array_merge($this->fileLayer, $this->dbLayer);
+    $maps = array_merge($this->fileLayer, $this->dbLayer, $this->vrtLayer);
     foreach ($maps as $map) {
       if (strpos($map['basename'], $this->layer) !== false) {
         $m = $map;
